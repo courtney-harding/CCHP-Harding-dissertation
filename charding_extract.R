@@ -27,9 +27,9 @@ library(data.table)
 
 ## load groupers and crosswalks -----------------------------------------------------------------
 load_groupers_and_crosswalks = function(){
-  ccs_file = "/home/rstudio/valid_cciccs_9only.csv"
+  ccs_file = "/home/airflow/valid_cciccs_9only.csv"
   ccs_grouper <<- read.csv(ccs_file)
-  statutes_grouper_file = "/home/rstudio/Statutes_v1_ch.csv"
+  statutes_grouper_file = "/home/airflow/Statutes_v1_ch.csv"
   statutes_grouper <<- read.csv(statutes_grouper_file)
 }
 
@@ -40,15 +40,27 @@ generate_full_table = function(){
   raw_ccpd_keys = get_all_ccpd_keys()
   raw_claims_keys = get_all_claims_keys()
   # clean keys
+  message("getting keys..")
   ccpd_keys = filter_ccpd_data(raw_ccpd_keys)
   claims_keys = filter_claims_data(raw_claims_keys)
+  remove(raw_ccpd_keys)
+  remove(raw_claims_keys)
+  gc()
   # generate demographics table
+  message("creating demographics table..")
   person_table = create_demographics_table(ccpd_keys, claims_keys)
   # generate wide tables (ccs, statutes, hospital, csh)
+  message("generating statutes_wide..")
   statutes_wide = generate_statutes_wide_table(ccpd_keys, person_table, statutes_grouper)
+  gc()
+  message("generating ccs_wide..")
   ccs_wide = generate_ccs_wide_table(claims_keys, person_table, ccs_grouper)
+  message("generating hospital_wide..")
   hospital_wide = generate_hospital_wide_table(claims_keys, person_table)
+  message("generating csh_wide..")
   csh_wide = generate_CSH_wide_table(claims_keys, person_table, ccs_grouper)
+  #
+  message("moving on..")
   # add unique row keys
   statutes_wide$row_key = paste0(statutes_wide$person_key, "_",  statutes_wide$timebin)
   ccs_wide$row_key = paste0(ccs_wide$person_key, "_",  ccs_wide$timebin)
@@ -65,26 +77,38 @@ generate_full_table = function(){
   rows_demographics_hospital = left_join(rows_demographics, hospital_wide, by = 'row_key')
   rows_demographics_hospital_csh = left_join(rows_demographics_hospital, csh_wide, by = 'row_key')
   final_table = left_join(rows_demographics_hospital_csh, statutes_wide, by = 'row_key')
+  #
+  final_table$coal_timebin = dplyr::coalesce(final_table$timebin, final_table$timebin.x, final_table$timebin.y)
+  #
   # and finally, clean up the duplicated fields that we picked up from the joins
-  final_table$timebin = final_table$timebin.x
+  # final_table$timebin = final_table$timebin.x
   final_table$person_key = final_table$person_key.x
   final_table$hosp_cooper = final_table$c
   final_table$hosp_lourdes = final_table$l
   final_table$hosp_virtua = final_table$v
+  final_table$n_ed_visits_perbin = final_table$hosp_cooper + final_table$hosp_lourdes + final_table$hosp_virtua
   #
   final_table$c = NULL
   final_table$v = NULL
   final_table$l = NULL
+  final_table$timebin = NULL
   final_table$timebin.x = NULL
   final_table$timebin.y = NULL
   final_table$person_key.x = NULL
   final_table$person_key.y = NULL
   final_table$person_key.x.x = NULL
   final_table$person_key.y.y = NULL
-
+  #
+  final_table$NA.y = NULL
+  final_table$NA.x = NULL
+  #
+  final_table$timebin = final_table$coal_timebin
+  final_table$coal_timebin = NULL
   #
   return(final_table)
 }
+
+
 
 
 
@@ -98,13 +122,7 @@ get_all_claims_keys = function(){
   db_conn = get_db_conn()
   on.exit(dbDisconnect(db_conn))
   #
-  sql = paste0("SELECT c.source_tag, b.person_key, c.row_key, ",
-               "c.visit_id, c.facility, c.admit_datetime, c.discharge_datetime, c.visit_type, ",
-               "c.sex, c.dob, c.race, c.ethnicity, c.cchp_financial_class, c.primary_payor_class, c.mco, c.payor_count,",
-               "c.secondary_payor_classes, c.dual, c.payor_flags, c.admit_dx_code_array, c.dx_code_array,",
-               "c.primary_dx_count, c.dx_poa_array, c.code_version, c.ccs_chronic_codes, c.primary_ccs_category_code, c.all_ccs_category_codes ",
-               "FROM identifiers.identifiers a, linkage_testing.person_table b, raw_data.harm_claims_view c WHERE ",
-              "a.source = 'ccpd' AND a.institutional = '' AND a.ident_key = b.ident_key AND b.person_key = c.person_key;")
+  sql = paste0("SELECT * from raw_data.harm_claims_view WHERE visit_type = 'ed';")
   long_claims_keys = RPostgres::dbGetQuery(db_conn, sql)
   #
   # now we deduplicate on row_key...
@@ -163,9 +181,28 @@ filter_claims_data = function(raw_claims_keys){
   claims_keys$age_noise = sample(offsets, size = nrow(claims_keys), replace = TRUE)
   claims_keys$age_months_at_event = claims_keys$age_noise + claims_keys$age_months_at_event
   #
+  #
+  #### now merge together admit_dx_code_array, dx_code_array, and dx_poa_array so we have all dx_codes in a single field.
+  claims_keys$all_dx_codes = paste0(claims_keys$admit_dx_code_array, ",", claims_keys$dx_code_array, ",", claims_keys$dx_poa_array)
+  #
+  #### finally, we're only concerned with the first 3 dx_codes, so separate those out from the rest.
+  claims_keys$first3_dx_codes = lapply(claims_keys$all_dx_codes, function(x) first_three_dx(x))
   return(claims_keys)
 }
 
+
+## return first three unique dx_codes -------------------------------------------------
+first_three_dx = function(dx_codes){
+  # here dx_codes is a single string containing multiple comma-separated dx_codes.
+  dx_split = unlist(str_split(dx_codes, pattern = ",", n = 100))
+  #
+  unique_dx_split = unique(dx_split)
+  unique_dx_split = unique_dx_split[nchar(unique_dx_split) > 0]
+  #
+  first_three = paste0(unique_dx_split[1:3], collapse = ",")
+  #
+  return(first_three)
+}
 
 
 ## filter ccpd data --------------------------------------------------
@@ -209,7 +246,10 @@ create_demographics_table = function(ccpd_keys, claims_keys){
   #
   #
   ccpd_common = dplyr::select(ccpd, person_key, institution, row_key, date, dob, sex, race)
-  claims_common = dplyr::select(claims, person_key, institution, row_key, date, dob, sex, race)
+  claims_common = dplyr::select(claims, person_key, institution, row_key, date, dob, sex, race, ethnicity)
+  claims_common = race_ethn_xwalk(claims_common)
+  claims_common$ethnicity = NULL
+  claims_common$paste_hosp = NULL
   common = rbind(ccpd_common, claims_common)
   #
   #
@@ -256,7 +296,9 @@ create_demographics_table = function(ccpd_keys, claims_keys){
   pd_join = dplyr::left_join(person_table, ccpd_person, by = 'person_key')
   demog_join = dplyr::left_join(person_table, claims_demographics, by = 'person_key')
   #
-  person_table$sex = pd_join$sex.y
+  #
+  #
+  person_table$sex = pd_join$sex.x
   person_table$race = pd_join$race
   # person_table$ethnicity = demog_join$ethnicity
   #
@@ -280,25 +322,35 @@ generate_ccs_wide_table = function(claims_keys, person_table, ccs_grouper){
   #
   claims_keys$timebin = get_date_code_from_ymd(claims_keys$ymd_date)
   #
-  claims_narrow = dplyr::select(claims_keys, person_key, visit_id, timebin, dx_code_array)
+  message("       creating claims_narrow..")
+  claims_narrow = dplyr::select(claims_keys, person_key, visit_id, timebin, first3_dx_codes)
+  names(claims_narrow) = c('person_key', 'visit_id', 'timebin', 'dx_code_array')
+  gc()
   #
+  message("       creating claims_long..")
   claims_long = claims_narrow %>%
     mutate(unravel = str_split(dx_code_array, ",")) %>%
     unnest %>%
     mutate(dx_code_array = str_trim(unravel))
   #
+  remove(claims_narrow)
+  gc()
   #### We need to remove the 'z_' that was placed in front of each icd9 code earlier.
   ccs_grouper$icd_code = str_sub(ccs_grouper$icd_code, 3)
   #
+  message("       matching dx_codes to ccs categories..")
   claims_long$ccs = ccs_grouper$ccs_category[match(unlist(claims_long$dx_code_array), ccs_grouper$icd_code)]
   #
+  gc()
   #### rather than just a number, let's make the CCS categories (which will become column names) a bit easier to work with.
   claims_long$ccs = paste0("ccs", str_pad(claims_long$ccs, 3, pad = "0"))
   #
   #### the dcast function here turns our long table (one row per diagnosis code) into a wide table
   #### with one row per person and a separate column for ccs dx_code group
-  claims_ccs_wide = dcast(claims_long, person_key + timebin ~ ccs)
+  message("       dcast to claims_ccs_wide..")
+  claims_ccs_wide = dcast(as.data.table(claims_long), person_key + timebin ~ ccs)
   #
+  gc()
   #
   return(claims_ccs_wide)
 }
@@ -378,8 +430,26 @@ generate_statutes_wide_table = function(ccpd_keys, person_table, statutes_groupe
   #### the dcast function here turns our long table (one row per violation) into a wide table
   #### with one row per person and a separate column for each statute violation group
   ccpd_wide = dcast(ccpd_keys, person_key + timebin ~ statute_group)
+  ccpd_wide$person_key_timebin = paste0(ccpd_wide$person_key, "_", ccpd_wide$timebin)
   #
-  return(ccpd_wide)
+  #### Now, we need to add a count of the number of arrests within each person_key & timebin.
+  #### Oftentimes arrestees are charged with multiple statute violations in a single arrest event.
+  #### Assuming that nobody has more than one arrest event per day, we can just take all unique combinations of
+  #### arrest_date and timebin, and obtain our counts from there.
+  ccpd_keys$arrest_date_bin = paste0(ccpd_keys$arrest_date, "_", ccpd_keys$timebin)
+  ccpd_keys_per_bin = ccpd_keys[!duplicated(ccpd_keys[,c('arrest_date_bin', 'person_key')]),]
+  #
+  #### next count the number of times each person_key & timebin combination occurs
+  ccpd_keys_per_bin$person_key_timebin = paste0(ccpd_keys_per_bin$person_key, "_", ccpd_keys_per_bin$timebin)
+  data.table::setDT(ccpd_keys_per_bin)[, person_key_timebin_freq :=.N, by=.(person_key_timebin)]
+  #
+  #### take only what we need..
+  ccpd_keys_n_per_bin = dplyr::select(ccpd_keys_per_bin, person_key_timebin, person_key_timebin_freq)
+  names(ccpd_keys_n_per_bin) = c('person_key_timebin', 'n_arrests_in_timebin')
+  #### finally, join it all back together.
+  final_ccpd_wide = left_join(ccpd_wide, ccpd_keys_n_per_bin, by = 'person_key_timebin')
+  #
+  return(final_ccpd_wide)
 }
 
 
@@ -404,7 +474,8 @@ generate_CSH_wide_table = function(claims_keys, person_table, csh_grouper){
   #
   claims_keys$timebin = get_date_code_from_ymd(claims_keys$ymd_date)
   #
-  claims_narrow = dplyr::select(claims_keys, person_key, visit_id, timebin, dx_code_array)
+  claims_narrow = dplyr::select(claims_keys, person_key, visit_id, timebin, first3_dx_codes)
+  names(claims_narrow) = c('person_key', 'visit_id', 'timebin', 'dx_code_array')
   #
   claims_long = claims_narrow %>%
     mutate(unravel = str_split(dx_code_array, ",")) %>%
@@ -425,6 +496,52 @@ generate_CSH_wide_table = function(claims_keys, person_table, csh_grouper){
   #
   return(claims_csh_wide)
 }
+
+
+
+## race & ethnicity crosswalk -------------------------------------
+race_ethn_xwalk = function(input_table){
+  xwalk = read.csv("~/ccpd_hosp_race_xwalk.csv")
+  #
+  xwalk$paste_hosp = paste0(xwalk$hosp_race, xwalk$hosp_ethn)
+  input_table$paste_hosp = paste0(input_table$race, input_table$ethnicity)
+  #
+  input_table$race = xwalk$ccpd_race[match(unlist(input_table$paste_hosp),xwalk$paste_hosp)]
+  return(input_table)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
