@@ -27,9 +27,9 @@ library(data.table)
 
 ## load groupers and crosswalks -----------------------------------------------------------------
 load_groupers_and_crosswalks = function(){
-  ccs_file = "/home/airflow/valid_cciccs_9only.csv"
+  ccs_file = "//home/airflow/CCHP-Harding-dissertation/valid_cciccs_9only_headerfix_ch.csv"
   ccs_grouper <<- read.csv(ccs_file)
-  statutes_grouper_file = "/home/airflow/Statutes_v1_ch.csv"
+  statutes_grouper_file = "/home/airflow/CCHP-Harding-dissertation/Statutes_v2_ch.csv"
   statutes_grouper <<- read.csv(statutes_grouper_file)
 }
 
@@ -327,6 +327,11 @@ generate_ccs_wide_table = function(claims_keys, person_table, ccs_grouper){
   names(claims_narrow) = c('person_key', 'visit_id', 'timebin', 'dx_code_array')
   gc()
   #
+  #### for visits with less than 3 dx_codes, we get a field that looks like "1234,NA,NA"
+  #### and those NAs screw up the unraveling. Gotta remove the ,NA first.
+  #
+  claims_narrow$dx_code_array = gsub(",NA", "", claims_narrow$dx_code_array)
+  #
   message("       creating claims_long..")
   claims_long = claims_narrow %>%
     mutate(unravel = str_split(dx_code_array, ",")) %>%
@@ -425,7 +430,7 @@ generate_statutes_wide_table = function(ccpd_keys, person_table, statutes_groupe
   #
   #### the CCPD data already has one row per statute violation, so no need to unravel it first.
   #### using the dawn_dirty_name column as a key, there are only 3 rows that fail to get placed into a group.
-  ccpd_keys$statute_group = statutes_grouper$CH_code_USE.THIS[match(unlist(ccpd_keys$statute_description), statutes_grouper$dawn_dirty_name)]
+  ccpd_keys$statute_group = statutes_grouper$CH_label_011719[match(unlist(ccpd_keys$statute_description), statutes_grouper$dawn_dirty_name)]
   #
   #### the dcast function here turns our long table (one row per violation) into a wide table
   #### with one row per person and a separate column for each statute violation group
@@ -477,6 +482,11 @@ generate_CSH_wide_table = function(claims_keys, person_table, csh_grouper){
   claims_narrow = dplyr::select(claims_keys, person_key, visit_id, timebin, first3_dx_codes)
   names(claims_narrow) = c('person_key', 'visit_id', 'timebin', 'dx_code_array')
   #
+  #### as before, for visits with less than 3 dx_codes, we get a field that looks like "1234,NA,NA"
+  #### and those NAs screw up the unraveling. Gotta remove the ,NA first.
+  #
+  claims_narrow$dx_code_array = gsub(",NA", "", claims_narrow$dx_code_array)
+  #
   claims_long = claims_narrow %>%
     mutate(unravel = str_split(dx_code_array, ",")) %>%
     unnest %>%
@@ -485,7 +495,7 @@ generate_CSH_wide_table = function(claims_keys, person_table, csh_grouper){
   #### We need to remove the 'z_' that was placed in front of each icd9 code earlier.
   csh_grouper$icd_code = str_sub(csh_grouper$icd_code, 3)
   #
-  claims_long$csh = csh_grouper$CH_label_USE.THIS[match(unlist(claims_long$dx_code_array), csh_grouper$icd_code)]
+  claims_long$csh = csh_grouper$CH_label_011719[match(unlist(claims_long$dx_code_array), csh_grouper$icd_code)]
   #
   #### rather than just a number, let's make the CCS categories (which will become column names) a bit easier to work with.
   # claims_long$csh = paste0("csh", str_pad(claims_long$csh, 3, pad = "0"))
