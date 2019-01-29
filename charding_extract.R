@@ -34,6 +34,14 @@ load_groupers_and_crosswalks = function(){
 }
 
 
+## detect duplicate rows in table ---------------------------------------
+detect_dupes = function(input_table){
+  input_table = data.table(input_table)
+  # setkey(input_table, person_key)
+  x = input_table[duplicated(input_table) | duplicated(input_table, fromLast = TRUE)]
+  return(nrow(x))
+}
+
 ## generate full, wide analysis table --------------------------------------------------------
 generate_full_table = function(){
   load_groupers_and_crosswalks()
@@ -451,6 +459,10 @@ generate_statutes_wide_table = function(ccpd_keys, person_table, statutes_groupe
   #### take only what we need..
   ccpd_keys_n_per_bin = dplyr::select(ccpd_keys_per_bin, person_key_timebin, person_key_timebin_freq)
   names(ccpd_keys_n_per_bin) = c('person_key_timebin', 'n_arrests_in_timebin')
+  #
+  #### remove duplicate rows from ccpd_keys_n_per_bin, we only need one row per person_key_timebin
+  #### to know how many arrest events occurred within that timebin.
+  ccpd_keys_n_per_bin = ccpd_keys_n_per_bin[!duplicated(ccpd_keys_n_per_bin[,c(person_key_timebin)]),]
   #### finally, join it all back together.
   final_ccpd_wide = left_join(ccpd_wide, ccpd_keys_n_per_bin, by = 'person_key_timebin')
   #
